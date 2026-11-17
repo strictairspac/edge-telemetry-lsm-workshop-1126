@@ -12,6 +12,7 @@
 - 层级配置：memtable 不同键容量、SSTable 合并触发数、层级上限、最终完整合并开关。
 - 合并队列：创建试验时持久化输入及配置快照，Redis 分发，独立 worker 执行并记录状态。
 - 读放大证据：显示合并前后层级、读写放大、真实存活键、Oracle 摘要、刷盘/合并轨迹、JSON 导出。
+- 离线归档：全量包与依赖前置包的增量包，按同一时点快照已完成试验及其引用批次/配置；换机恢复时内容指纹判重、重映射引用，篡改/缺祖先/引用缺失整包拒绝。
 - 管理员审计：记录写操作账号、路由与 HTTP 结果，包含权限拒绝。
 
 | 角色 | 页面与权限 | 典型动作 |
@@ -67,6 +68,16 @@ Seed另含“旧值复活回归集”和“全部删除边界集”；配置另�
 
 输出包括真实计算的层级表数/键范围/墓碑数、每步刷盘合并轨迹、输入键数、存活键、写出条目、读写放大、Oracle及实际键值、摘要。空输入和超限在提交时422，引用不存在404，重名409，排队/运行总数超过20时429；worker失败保存error和failed状态。
 
+## 离线备份与恢复（换机）
+
+页面 05「备份与恢复」面向工坊换机，全部操作在管理员侧完成，观察员与操作员只读。
+
+- **全量与增量**：每个工坊一条单调备份链，全量包为 1 号基线，增量包携带 `parent_id` 并只含上一包水位线之后的新增对象（已完成试验 + 引用到的批次/配置）。单事务快照保证一包对应同一时点；备份期间仍可创建试验，快照之后新增或仍在排队/运行的对象留给下一包，试验水位线只推进到实际入包对象的最大 id。
+- **包格式 `lsm-archive/v1`**：单个 JSON，含 manifest（对象 SHA-256 指纹索引、父链、水位线）、payload（完整业务内容）与覆盖规范化 manifest+payload 的签名。备份文件落在 `ARCHIVE_DIR`（容器内 `/artifacts/archives`），页面可直接下载，离线拷贝到新机上传。
+- **恢复状态机**：上传后为「待校验」，应用时先验签与指纹，再核对祖先链（全量无父包、增量逐包衔接且祖先已可用）与跨包引用，通过后单事务写入、全部对象一同可见，状态转「可用」；任何失败整包回滚转「整包拒绝」，不留半截数据。
+- **重映射规则**：同名同内容直接复用并补登内容指纹台账；同名异内容自动另存为「原名 (恢复 序号-包号-n)」，原有试验与配置保持不动。重试或中断恢复由 `(类型, 内容哈希)` 台账去重，不重复新增；进程重启会把卡在「恢复中」的任务退回待校验。
+- **拒绝条件**：字节/载荷被篡改（签名或指纹不符）、缺祖先包或序号断链、试验引用的批次/配置在本包与祖先包中均缺失，任一命中即整包拒绝。被拒绝的包在补齐条件后可重新上传回到待校验。
+
 ## 技术栈与代码组织
 
 | 服务 | 实现与作用 |
@@ -77,7 +88,7 @@ Seed另含“旧值复活回归集”和“全部删除边界集”；配置另�
 | db | MySQL8.0，持久化3个业务实体、用户与审计 |
 | redis | Redis7，异步队列与持久卷 |
 
-`backend/src/`分为config/models/schemas/services/controllers/routes/middlewares/utils/constants；`backend/scripts/seed_demo.py`种子与初始化；`backend/migrations/README.md`为schema v1说明。3实体dataset/config/trial各自贯穿model/schema/service/route、前端api/store/page。试验结果保存在Trial JSON字段中，详情页为独立业务页面。
+`backend/src/`分为config/models/schemas/services/controllers/routes/middlewares/utils/constants；`backend/scripts/seed_demo.py`种子与初始化；`backend/migrations/README.md`为schema v1/v2说明。3实体dataset/config/trial各自贯穿model/schema/service/route、前端api/store/page。试验结果保存在Trial JSON字段中，详情页为独立业务页面。备份恢复由`services/archive.py`（备份/恢复/重映射）与`services/archive_package.py`（封包/验包纯函数）承担，对应`models/archive.py`三张表与`routes/archive.py`，前端页面为`pages/archives.js`。
 
 `frontend/src/`包含api/stores/types/components/common/hooks/pages/router/utils/constants，表格/状态/页头跨页共享，HTML转义与反馈工具复用。角色/任务状态/操作类型枚举在`backend/src/constants/enums.py`和`frontend/src/constants/enums.js`。模型默认任务状态使用后端枚举，前端状态组件使用前端枚举。
 
